@@ -598,13 +598,7 @@ body::before {
 
     <div class="worker-card" id="worker-card"></div>
 
-    <div class="fields-row">
-      <select class="select-inp" id="scan-type">
-        <option value="start">▶  Start</option>
-        <option value="end">■  End</option>
-      </select>
-      <input class="inp" id="workstation" placeholder="Workstation (e.g. A)"/>
-    </div>
+    
 
     <!-- ── ADD PART PANEL ── -->
     <div class="add-panel" id="add-panel">
@@ -870,36 +864,62 @@ async function stopPartCamera() {
 }
 
 async function onPartScanned(decoded) {
-  if (!S.continuous) {
-    // one-shot: stop camera, add part, close panel
-    await stopPartCamera();
-  }
-
   flash('part-scan-flash');
+  const parsed = parseQR(decoded);
 
-  if (S.parts.find(p => p.qr === decoded)) {
-    toast('Already added', '');
-    if (!S.continuous) closePanel();
+  if (parsed.type === 'unknown') {
+    toast('<i class="ti ti-alert-circle"></i> Unknown QR — must start with BULK- or UNIT-', 'err');
+    pausePartCam();
     return;
   }
 
-  const match = QUICK_PARTS.find(p => p.qr === decoded);
-  S.parts.push({ qr: decoded, label: match ? match.label : decoded, time: TS() });
-  renderParts();
-  toast('<i class="ti ti-check"></i> Part scanned', 'ok');
-
-  if (!S.continuous) {
-    closePanel();
-  } else {
-    // brief pause so the same QR isn't immediately re-detected
-    if (S.partQR && S.partCamOn) {
-      S.partQR.pause();
-      setTimeout(() => {
-        try { if (S.partQR && S.partCamOn) S.partQR.resume(); } catch(_){}
-      }, 1500);
+  if (parsed.type === 'unit') {
+    if (S.parts.find(p => p.qr === parsed.qr)) {
+      toast('<i class="ti ti-alert-triangle"></i> Already scanned', '');
+      pausePartCam();
+      return;
     }
+    await stopPartCamera();
+    S.parts.push({ ...parsed, qty: 1, time: TS() });
+    renderParts();
+    closePanel();
+    toast('<i class="ti ti-check"></i> ' + parsed.label + ' added', 'ok');
+    return;
+  }
+
+  if (parsed.type === 'bulk') {
+    await stopPartCamera();
+    openBulkModal(parsed);
   }
 }
+
+function pausePartCam() {
+  if (S.partQR && S.partCamOn) {
+    S.partQR.pause();
+    setTimeout(() => { try { if (S.partQR && S.partCamOn) S.partQR.resume(); } catch(_){} }, 1500);
+  }
+}
+
+function parseQR(raw) {
+  raw = raw.trim();
+  if (raw.startsWith('BULK-')) {
+    const parts = raw.split('-');
+    const itemId = parts[1] || raw;
+    const batchId = parts.slice(2).join('-') || '';
+    const label = itemId.charAt(0).toUpperCase() + itemId.slice(1).toLowerCase();
+    return { type: 'bulk', qr: raw, itemId, batchId, label, unit: 'pcs' };
+  }
+  if (raw.startsWith('UNIT-')) {
+    const parts = raw.split('-');
+    const itemId = parts[1] || raw;
+    const serial = parts.slice(2).join('-') || '';
+    const label = itemId.charAt(0).toUpperCase() + itemId.slice(1).toLowerCase();
+    return { type: 'unit', qr: raw, itemId, serial, label };
+  }
+  return { type: 'unknown', qr: raw, label: raw };
+}
+
+
 
 function toggleContinuousScan() {
   S.continuous = !S.continuous;
@@ -1077,11 +1097,31 @@ function addQuick(qr, label) {
 function confirmPart() {
   const val = $('part-inp').value.trim();
   if (!val) return;
-  if (S.parts.find(p=>p.qr===val)) { toast('Already added', ''); closePanel(); return; }
-  const match = QUICK_PARTS.find(p=>p.qr===val);
-  S.parts.push({ qr: val, label: match ? match.label : val, time: TS() });
-  closePanel(); renderParts();
-  toast('<i class="ti ti-check"></i> Part added', 'ok');
+
+  const parsed = parseQR(val);
+
+  if (parsed.type === 'unknown') {
+    toast('<i class="ti ti-alert-circle"></i> Unknown QR — must start with BULK- or UNIT-', 'err');
+    return;
+  }
+
+  if (parsed.type === 'unit') {
+    if (S.parts.find(p => p.qr === parsed.qr)) {
+      toast('<i class="ti ti-alert-triangle"></i> Already scanned', '');
+      closePanel();
+      return;
+    }
+    S.parts.push({ ...parsed, qty: 1, time: TS() });
+    closePanel();
+    renderParts();
+    toast('<i class="ti ti-check"></i> ' + parsed.label + ' added', 'ok');
+    return;
+  }
+
+  if (parsed.type === 'bulk') {
+    closePanel();
+    openBulkModal(parsed);
+  }
 }
 
 $('part-inp').addEventListener('keydown', e => { if(e.key==='Enter') confirmPart(); });
@@ -1097,35 +1137,102 @@ function renderParts() {
   const n = S.parts.length;
   $('count-pill').textContent = n + (n===1?' part':' parts');
   $('submit-btn').disabled = n === 0;
-
-  // show scan-more button only if there are parts and panel is closed
   $('scan-more-btn').style.display = n > 0 ? 'flex' : 'none';
   $('add-first-btn').style.display = n > 0 ? 'none' : 'flex';
 
   if (!n) {
-    list.innerHTML = `<div class="empty-parts">
-      <i class="ti ti-package-off"></i>No parts yet — add one above</div>`;
+    list.innerHTML = '<div class="empty-parts"><i class="ti ti-package-off"></i>No parts yet — add one above</div>';
     return;
   }
-  list.innerHTML = S.parts.map(p => `
-    <div class="part-item">
-      <div class="part-icon"><i class="ti ti-components"></i></div>
+  list.innerHTML = S.parts.map(p => {
+    const isBulk = p.type === 'bulk';
+    const iconStyle = isBulk
+      ? 'background:rgba(251,191,36,0.1);border:1px solid rgba(251,191,36,0.2);color:var(--amber)'
+      : 'background:rgba(74,222,128,0.1);border:1px solid rgba(74,222,128,0.2);color:var(--green)';
+    const icon = isBulk ? 'ti-packages' : 'ti-components';
+    const qtyBadge = isBulk
+      ? `<span style="font-family:var(--mono);font-size:11px;background:rgba(251,191,36,0.15);color:var(--amber);border:1px solid rgba(251,191,36,0.2);padding:1px 7px;border-radius:8px">× ${p.qty} pcs</span>`
+      : `<span style="font-family:var(--mono);font-size:11px;color:var(--green)">#${p.serial}</span>`;
+    return `<div class="part-item">
+      <div class="part-icon" style="${iconStyle}"><i class="ti ${icon}"></i></div>
       <div class="part-info">
-        <div class="part-name">${p.label}</div>
+        <div class="part-name" style="display:flex;align-items:center;gap:6px">${p.label} ${qtyBadge}</div>
         <div class="part-meta">${p.qr} · ${p.time}</div>
       </div>
-      <button class="part-del" onclick="removePart('${p.qr}')">
-        <i class="ti ti-trash"></i>
-      </button>
-    </div>`).join('');
+      <button class="part-del" onclick="removePart('${p.qr}')"><i class="ti ti-trash"></i></button>
+    </div>`;
+  }).join('');
+}
+ 
+
+let pendingBulk = null;
+
+function openBulkModal(parsed) {
+  pendingBulk = parsed;
+  const overlay = document.createElement('div');
+  overlay.id = 'bulk-overlay';
+  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.7);z-index:200;display:flex;align-items:flex-end;justify-content:center';
+  overlay.innerHTML = `
+    <div style="background:var(--navy2);border-radius:20px 20px 0 0;padding:24px 20px 36px;width:100%;max-width:430px">
+      <div style="width:36px;height:4px;border-radius:2px;background:var(--navy3);margin:0 auto 20px"></div>
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:16px">
+        <div style="width:40px;height:40px;border-radius:10px;background:rgba(251,191,36,0.15);border:1px solid rgba(251,191,36,0.25);display:flex;align-items:center;justify-content:center;font-size:20px;color:var(--amber)"><i class="ti ti-packages"></i></div>
+        <div>
+          <div style="font-size:16px;font-weight:600">${parsed.label} (Batch ${parsed.batchId})</div>
+          <div style="font-size:12px;font-family:var(--mono);color:var(--muted)">${parsed.qr}</div>
+        </div>
+      </div>
+      <div style="font-size:13px;color:var(--muted);margin-bottom:8px">How many did you take?</div>
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:20px">
+        <button onclick="stepQty(-1)" style="width:44px;height:44px;border-radius:10px;background:var(--surface2);border:1px solid var(--border);color:var(--text);font-size:22px;cursor:pointer;display:flex;align-items:center;justify-content:center;flex-shrink:0">−</button>
+        <input id="bulk-qty-inp" type="number" min="1" value="1" inputmode="numeric"
+          style="flex:1;text-align:center;font-size:22px;font-family:var(--mono);font-weight:500;padding:10px;background:var(--surface);border:1px solid var(--border);border-radius:10px;color:var(--text);outline:none;-webkit-appearance:none"/>
+        <button onclick="stepQty(1)" style="width:44px;height:44px;border-radius:10px;background:var(--surface2);border:1px solid var(--border);color:var(--text);font-size:22px;cursor:pointer;display:flex;align-items:center;justify-content:center;flex-shrink:0">+</button>
+        <span style="font-size:13px;color:var(--muted)">pcs</span>
+      </div>
+      <div style="display:flex;gap:10px">
+        <button class="btn btn-ghost" style="flex:1;padding:14px" onclick="closeBulkModal()">Cancel</button>
+        <button class="btn btn-blue" style="flex:1;padding:14px" onclick="confirmBulk()"><i class="ti ti-check"></i> Confirm</button>
+      </div>
+    </div>`;
+  document.body.appendChild(overlay);
+  setTimeout(() => document.getElementById('bulk-qty-inp').focus(), 300);
+}
+
+function stepQty(delta) {
+  const el = document.getElementById('bulk-qty-inp');
+  el.value = Math.max(1, (parseInt(el.value) || 0) + delta);
+}
+
+function closeBulkModal() {
+  const el = document.getElementById('bulk-overlay');
+  if (el) el.remove();
+  pendingBulk = null;
+  setTimeout(startPartCamera, 200);
+}
+
+function confirmBulk() {
+  const qty = parseInt(document.getElementById('bulk-qty-inp').value) || 0;
+  if (qty < 1) { toast('Enter quantity ≥ 1', 'err'); return; }
+  const p = pendingBulk;
+  const existing = S.parts.find(x => x.qr === p.qr);
+  if (existing) {
+    existing.qty += qty;
+    existing.time = TS();
+    toast('<i class="ti ti-plus"></i> +' + qty + ' added — total ' + existing.qty, 'ok');
+  } else {
+    S.parts.push({ ...p, qty, time: TS() });
+    toast('<i class="ti ti-check"></i> ' + p.label + ' × ' + qty + ' added', 'ok');
+  }
+  closeBulkModal();
+  renderParts();
+  closePanel();
 }
 
 // ─────────────────────────────────────────────────────────
 // SUBMIT
 // ─────────────────────────────────────────────────────────
 async function submitSession() {
-  const scanType    = $('scan-type').value;
-  const workstation = $('workstation').value.trim() || null;
   const w = S.worker;
 
   $('submit-btn').disabled = true;
@@ -1137,10 +1244,10 @@ async function submitSession() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          worker_qr:   w.qr_code_data,
-          part_qr:     part.qr,
-          scan_type:   scanType,
-          workstation: workstation
+          worker_qr:  w.qr_code_data,
+          part_qr:    part.qr,
+          quantity:   part.qty || 1,
+          workstation: null
         })
       });
       if (!res.ok) {
@@ -1160,9 +1267,6 @@ async function submitSession() {
 
   clearInterval(S.tick);
   const elapsed = S.t0 ? Math.round((Date.now()-S.t0)/1000) : 0;
-  const typeTag  = scanType === 'start'
-    ? '<span class="tag-start">▶ Start</span>'
-    : '<span class="tag-end">■ End</span>';
 
   $('scr-parts').style.display = 'none';
   $('scr-done').style.display  = 'block';
@@ -1172,8 +1276,6 @@ async function submitSession() {
   $('summary').innerHTML = `
     <div class="sum-row"><span class="sum-label">Worker</span><span class="sum-val">${w.name}</span></div>
     <div class="sum-row"><span class="sum-label">Department</span><span class="sum-val">${w.department}</span></div>
-    <div class="sum-row"><span class="sum-label">Scan type</span><span class="sum-val">${typeTag}</span></div>
-    <div class="sum-row"><span class="sum-label">Workstation</span><span class="sum-val">${workstation||'—'}</span></div>
     <div class="sum-row"><span class="sum-label">Parts</span><span class="sum-val">${S.parts.length}</span></div>
     <div class="sum-row"><span class="sum-label">Session</span><span class="sum-val">${Math.floor(elapsed/60)}m ${elapsed%60}s</span></div>
     <div class="sum-row"><span class="sum-label">Submitted</span><span class="sum-val">${TS()}</span></div>`;
@@ -1194,7 +1296,7 @@ function reset() {
   $('stp1').classList.add('active');
   $('sn1').textContent='1'; $('sn2').textContent='2'; $('sn3').textContent='3';
   $('worker-inp').value = '';
-  $('workstation').value = '';
+  
   $('session-pill').classList.remove('on');
   $('add-panel').classList.remove('open');
   $('worker-err').classList.remove('on');
